@@ -41,7 +41,7 @@ impl NodejsWorker {
     });
   }
 
-    pub fn eval<Code: AsRef<str>>(
+  pub fn eval<Code: AsRef<str>>(
     &self,
     code: Code,
     callback: impl 'static + Send + FnOnce(Env, JsUnknown),
@@ -154,7 +154,7 @@ impl NodejsWorker {
         callback: Box::new(callback),
       })
       .unwrap();
-    
+
     Ok(())
   }
 

@@ -639,7 +639,8 @@ unsafe extern "C" fn thread_finalize_cb<T: 'static, V: ToNapiValue, R>(
     unsafe { libnode_sys::napi_remove_env_cleanup_hook(env, Some(env_teardown_cb), finalize_data) };
   }
 
-  let handle_weak = unsafe { Box::from_raw(finalize_data.cast::<Weak<ThreadsafeFunctionHandle>>()) };
+  let handle_weak =
+    unsafe { Box::from_raw(finalize_data.cast::<Weak<ThreadsafeFunctionHandle>>()) };
 
   if let Some(handle) = handle_weak.upgrade() {
     handle.with_write_aborted(|mut aborted_guard| {
