@@ -517,6 +517,58 @@ impl<T: 'static> ThreadsafeFunction<T, ErrorStrategy::CalleeHandled> {
       .into()
     })
   }
+
+  /// Calls the threadsafe function and awaits the JS callback's return value. Ported from
+  /// napi-rs's `ThreadsafeFunction::call_async`; combine with
+  /// [`Promise<D>`](crate::napi::bindgen_runtime::Promise) as the return type to await an
+  /// async JS function end-to-end.
+  #[cfg(feature = "tokio_rt")]
+  pub async fn call_async<D: 'static + FromNapiValue>(
+    &self,
+    value: Result<T>,
+  ) -> Result<D> {
+    let (sender, receiver) = tokio::sync::oneshot::channel::<Result<D>>();
+
+    self.handle.with_read_aborted(|aborted| {
+      if aborted {
+        return Err(crate::napi::Error::from_status(Status::Closing));
+      }
+
+      check_status!(
+        unsafe {
+          libnode_sys::napi_call_threadsafe_function(
+            self.handle.get_raw(),
+            Box::into_raw(Box::new(value.map(|data| {
+              ThreadsafeFunctionCallJsBackData {
+                data,
+                call_variant: ThreadsafeFunctionCallVariant::WithCallback,
+                callback: Box::new(move |d: Result<JsUnknown>| {
+                  sender
+                    .send(d.and_then(|d| D::from_napi_value(d.0.env, d.0.value)))
+                    // The only reason for send to return Err is if the receiver isn't listening
+                    // Not hiding the error would result in a napi_fatal_error call, it's safe to ignore it instead.
+                    .or(Ok(()))
+                }),
+              }
+            })))
+            .cast(),
+            libnode_sys::ThreadsafeFunctionCallMode::nonblocking,
+          )
+        },
+        "Threadsafe function call_async failed"
+      )
+    })?;
+
+    receiver
+      .await
+      .map_err(|_| {
+        crate::napi::Error::new(
+          Status::GenericFailure,
+          "Receive value from threadsafe function sender failed",
+        )
+      })
+      .and_then(|ret| ret)
+  }
 }
 
 impl<T: 'static> ThreadsafeFunction<T, ErrorStrategy::Fatal> {
@@ -575,6 +627,54 @@ impl<T: 'static> ThreadsafeFunction<T, ErrorStrategy::Fatal> {
       }
       .into()
     })
+  }
+
+  /// Calls the threadsafe function and awaits the JS callback's return value. Ported from
+  /// napi-rs's `ThreadsafeFunction::call_async`; combine with
+  /// [`Promise<D>`](crate::napi::bindgen_runtime::Promise) as the return type to await an
+  /// async JS function end-to-end.
+  #[cfg(feature = "tokio_rt")]
+  pub async fn call_async<D: 'static + FromNapiValue>(
+    &self,
+    value: T,
+  ) -> Result<D> {
+    let (sender, receiver) = tokio::sync::oneshot::channel::<D>();
+
+    self.handle.with_read_aborted(|aborted| {
+      if aborted {
+        return Err(crate::napi::Error::from_status(Status::Closing));
+      }
+
+      check_status!(
+        unsafe {
+          libnode_sys::napi_call_threadsafe_function(
+            self.handle.get_raw(),
+            Box::into_raw(Box::new(ThreadsafeFunctionCallJsBackData {
+              data: value,
+              call_variant: ThreadsafeFunctionCallVariant::WithCallback,
+              callback: Box::new(move |d: Result<JsUnknown>| {
+                d.and_then(|d| {
+                  D::from_napi_value(d.0.env, d.0.value).and_then(move |d| {
+                    sender
+                      .send(d)
+                      // The only reason for send to return Err is if the receiver isn't listening
+                      // Not hiding the error would result in a napi_fatal_error call, it's safe to ignore it instead.
+                      .or(Ok(()))
+                  })
+                })
+              }),
+            }))
+            .cast(),
+            libnode_sys::ThreadsafeFunctionCallMode::nonblocking,
+          )
+        },
+        "Threadsafe function call_async failed"
+      )
+    })?;
+
+    receiver
+      .await
+      .map_err(|err| crate::napi::Error::new(Status::GenericFailure, format!("{}", err)))
   }
 }
 

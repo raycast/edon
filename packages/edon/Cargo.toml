@@ -11,6 +11,7 @@ license = "MIT"
 serde-json = ["serde", "serde_json"]
 error-anyhow = ["anyhow"]
 chrono-date = ["chrono"]
+tokio_rt = ["tokio"]
 
 [lib]
 
@@ -25,3 +26,4 @@ anyhow = { version = "^1", optional = true }
 serde = { version = "^1", optional = true }
 serde_json = { version = "^1", optional = true }
 chrono = { version = "^0.4", optional = true }
+tokio = { version = "^1", default-features = false, features = ["sync"], optional = true }
