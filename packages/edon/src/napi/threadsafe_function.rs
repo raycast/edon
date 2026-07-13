@@ -372,6 +372,10 @@ impl<T: 'static, ES: ErrorStrategy::T> ThreadsafeFunction<T, ES> {
     let mut raw_tsfn = ptr::null_mut();
     let callback_ptr = Box::into_raw(Box::new(callback));
     let handle = ThreadsafeFunctionHandle::null();
+    // Shared by thread_finalize_cb and env_teardown_cb; freed exactly once, by
+    // thread_finalize_cb (which napi guarantees to call exactly once, and which during an env
+    // teardown runs after the LIFO-ordered cleanup hooks).
+    let handle_weak_ptr = Box::into_raw(Box::new(Arc::downgrade(&handle)));
     check_status!(unsafe {
       libnode_sys::napi_create_threadsafe_function(
         env,
@@ -380,14 +384,27 @@ impl<T: 'static, ES: ErrorStrategy::T> ThreadsafeFunction<T, ES> {
         async_resource_name,
         max_queue_size,
         1,
-        Arc::downgrade(&handle).into_raw() as *mut c_void, // pass handler to thread_finalize_cb
+        handle_weak_ptr.cast(), // pass handler to thread_finalize_cb
         Some(thread_finalize_cb::<T, V, R>),
         callback_ptr.cast(),
         Some(call_js_cb::<T, V, R, ES>),
         &mut raw_tsfn,
       )
+    })
+    .inspect_err(|_| {
+      drop(unsafe { Box::from_raw(handle_weak_ptr) });
     })?;
     handle.set_raw(raw_tsfn);
+
+    // Pre-abort the threadsafe function when its environment tears down. Node registers the
+    // threadsafe function's own teardown as an env cleanup hook at creation; hooks run in
+    // reverse registration order, so this hook (registered after) runs first and aborts the
+    // threadsafe function under the `aborted` lock *before* Node finalizes it. Without it, a
+    // handle dropped from a foreign thread while the environment is mid-teardown races Node's
+    // finalization of the same threadsafe function and corrupts the heap.
+    check_status!(unsafe {
+      libnode_sys::napi_add_env_cleanup_hook(env, Some(env_teardown_cb), handle_weak_ptr.cast())
+    })?;
 
     Ok(ThreadsafeFunction {
       handle,
@@ -678,6 +695,35 @@ impl<T: 'static> ThreadsafeFunction<T, ErrorStrategy::Fatal> {
   }
 }
 
+/// Aborts the threadsafe function when its environment starts tearing down, before Node
+/// finalizes it. Runs on the environment's thread; the `aborted` write lock serializes it
+/// against handle drops and calls on foreign threads, so after this hook ran (or while it
+/// runs) no foreign thread can touch the dying threadsafe function anymore.
+unsafe extern "C" fn env_teardown_cb(data: *mut c_void) {
+  let handle_weak = unsafe { &*data.cast::<Weak<ThreadsafeFunctionHandle>>() };
+  let Some(handle) = handle_weak.upgrade() else {
+    // The last handle was already dropped (and released the threadsafe function itself).
+    return;
+  };
+
+  handle.with_write_aborted(|mut aborted_guard| {
+    if !*aborted_guard {
+      let release_status = unsafe {
+        libnode_sys::napi_release_threadsafe_function(
+          handle.get_raw(),
+          libnode_sys::ThreadsafeFunctionReleaseMode::abort,
+        )
+      };
+      debug_assert!(
+        release_status == libnode_sys::Status::napi_ok,
+        "Abort threadsafe function on env teardown failed {}",
+        Status::from(release_status)
+      );
+      *aborted_guard = true;
+    }
+  });
+}
+
 #[allow(unused_variables)]
 unsafe extern "C" fn thread_finalize_cb<T: 'static, V: ToNapiValue, R>(
   env: libnode_sys::napi_env,
@@ -686,10 +732,16 @@ unsafe extern "C" fn thread_finalize_cb<T: 'static, V: ToNapiValue, R>(
 ) where
   R: 'static + Send + FnMut(ThreadSafeCallContext<T>) -> Result<Vec<V>>,
 {
-  let handle_option =
-    unsafe { Weak::from_raw(finalize_data.cast::<ThreadsafeFunctionHandle>()).upgrade() };
+  // The teardown hook must be unregistered before its data is freed below. If it already ran
+  // (env teardown finalized this threadsafe function), Node has dequeued it and the removal is
+  // a harmless no-op error.
+  if !env.is_null() {
+    unsafe { libnode_sys::napi_remove_env_cleanup_hook(env, Some(env_teardown_cb), finalize_data) };
+  }
 
-  if let Some(handle) = handle_option {
+  let handle_weak = unsafe { Box::from_raw(finalize_data.cast::<Weak<ThreadsafeFunctionHandle>>()) };
+
+  if let Some(handle) = handle_weak.upgrade() {
     handle.with_write_aborted(|mut aborted_guard| {
       if !*aborted_guard {
         *aborted_guard = true;
