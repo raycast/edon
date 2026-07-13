@@ -29,6 +29,8 @@ mod map;
 mod nil;
 mod number;
 mod object;
+#[cfg(feature = "tokio_rt")]
+mod promise;
 #[cfg(feature = "serde-json")]
 mod serde;
 mod string;
@@ -46,6 +48,8 @@ pub use external::*;
 pub use function::*;
 pub use nil::*;
 pub use object::*;
+#[cfg(feature = "tokio_rt")]
+pub use promise::*;
 pub use string::*;
 pub use symbol::*;
 pub use task::*;
